@@ -101,16 +101,6 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         self.routing_keys = routing_keys
         self.channel.exchange_declare(exchange=exchange_name, exchange_type='topic')
 
-        result = self.channel.queue_declare(queue='', exclusive=True, auto_delete=True)
-        self.queue_name = result.method.queue
-
-        for routing_key in routing_keys:
-            self.channel.queue_bind(
-                exchange=self.exchange_name,
-                queue=self.queue_name,
-                routing_key=routing_key,
-            )
-
     def start_consuming(self, on_message_callback):
         """
         Inicia el consumo bloqueante de mensajes del exchange.
@@ -119,6 +109,16 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         - `on_message_callback`: función con firma
           `callback(message, ack, nack)`.
         """
+        result = self.channel.queue_declare(queue='', exclusive=True, auto_delete=True)
+        self.queue_name = result.method.queue
+
+        for routing_key in self.routing_keys:
+            self.channel.queue_bind(
+                exchange=self.exchange_name,
+                queue=self.queue_name,
+                routing_key=routing_key,
+            )
+
         def callback(ch, method, properties, body):
             try:
                 on_message_callback(
