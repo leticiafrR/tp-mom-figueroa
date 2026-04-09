@@ -1,6 +1,46 @@
+from os import close
+
 import pika
-from pika.exceptions import AMQPConnectionError, AMQPError
-from .middleware import MessageMiddlewareQueue, MessageMiddlewareExchange, MessageMiddlewareMessageError, MessageMiddlewareDisconnectedError, MessageMiddlewareCloseError
+from pika.exceptions import (
+    AMQPConnectionError,
+    AMQPError,
+    ChannelClosed,
+    ChannelClosedByBroker,
+    ChannelClosedByClient,
+    ChannelWrongStateError,
+    ConnectionClosed,
+    ConnectionClosedByBroker,
+    ConnectionClosedByClient,
+    ConnectionWrongStateError,
+    StreamLostError,
+)
+from .middleware import (
+    MessageMiddlewareQueue,
+    MessageMiddlewareExchange,
+    MessageMiddlewareMessageError,
+    MessageMiddlewareDisconnectedError,
+    MessageMiddlewareCloseError,
+    MessageMiddlewareDeleteError
+)
+
+
+_DISCONNECTED_ERRORS = (
+    AMQPConnectionError,
+    AMQPError,
+    ChannelClosed,
+    ChannelClosedByBroker,
+    ChannelClosedByClient,
+    ChannelWrongStateError,
+    ConnectionClosed,
+    ConnectionClosedByBroker,
+    ConnectionClosedByClient,
+    ConnectionWrongStateError,
+    StreamLostError,
+)
+
+
+def _is_disconnected_error(error):
+    return isinstance(error, _DISCONNECTED_ERRORS)
 
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
@@ -17,13 +57,6 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
     """
 
     def __init__(self, host, queue_name):
-        """
-        Crea una instancia asociada a una cola.
-
-        Parámetros:
-        - `host`: host/IP de RabbitMQ.
-        - `queue_name`: nombre de la cola.
-        """
         self.queue_name = queue_name
         try:
             self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
@@ -36,10 +69,6 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
                 f"Failed to initialize queue middleware for '{queue_name}': {str(error)}"
             ) from error
 
-    def _ensure_open(self):
-        if not self.connection.is_open or not self.channel.is_open:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ")
-
     def send(self, message):
         """
         Envía un mensaje a la cola configurada.
@@ -48,13 +77,10 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         - `message`: contenido a publicar (bytes).
         """
         try:
-            self._ensure_open()
             self.channel.basic_publish(exchange='', routing_key=self.queue_name, body=message)
-        except MessageMiddlewareDisconnectedError:
-            raise
-        except AMQPConnectionError as error:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
         except Exception as error:
+            if _is_disconnected_error(error):
+                raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
             raise MessageMiddlewareMessageError(
                 f"Failed to send message to queue '{self.queue_name}': {str(error)}"
             ) from error
@@ -69,21 +95,23 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         """
 
         def callback(ch, method, properties, body):
+            def ack():
+                try:
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                except Exception as error:
+                    if _is_disconnected_error(error):
+                        raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
+                    raise MessageMiddlewareMessageError(f"Failed to ack message: {str(error)}") from error
+
+            def nack():
+                try:
+                    ch.basic_nack(delivery_tag=method.delivery_tag)
+                except Exception as error:
+                    if _is_disconnected_error(error):
+                        raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
+                    raise MessageMiddlewareMessageError(f"Failed to nack message: {str(error)}") from error
+
             try:
-                self._ensure_open()
-
-                def ack():
-                    try:
-                        ch.basic_ack(delivery_tag=method.delivery_tag)
-                    except AMQPError as error:
-                        raise MessageMiddlewareMessageError(f"Failed to ack message: {str(error)}") from error
-
-                def nack():
-                    try:
-                        ch.basic_nack(delivery_tag=method.delivery_tag)
-                    except AMQPError as error:
-                        raise MessageMiddlewareMessageError(f"Failed to nack message: {str(error)}") from error
-
                 on_message_callback(
                     body,
                     ack,
@@ -97,24 +125,24 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
                 )
 
         try:
-            self._ensure_open()
             self.channel.basic_consume(queue=self.queue_name, on_message_callback=callback, auto_ack=False)
             self.channel.start_consuming()
         except MessageMiddlewareDisconnectedError:
             raise
-        except AMQPConnectionError as error:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
         except Exception as error:
+            if _is_disconnected_error(error):
+                raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
             raise MessageMiddlewareMessageError(f"Failed to consume queue '{self.queue_name}': {str(error)}") from error
 
     def stop_consuming(self):
         """Detiene el consumo iniciado con `start_consuming()`."""
         try:
-            self._ensure_open()
             self.channel.stop_consuming()
         except MessageMiddlewareDisconnectedError:
             raise
         except Exception as error:
+            if _is_disconnected_error(error):
+                raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
             raise MessageMiddlewareMessageError(f"Failed to stop queue consumer: {str(error)}") from error
 
     def close(self):
@@ -129,169 +157,74 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
-    """
-    Cliente de exchange RabbitMQ.
-
-    Qué hace:
-    - Permite consumir mensajes para una o más routing keys.
-    - Permite publicar mensajes al exchange.
-
-    Qué proveer:
-    - `host`: host/IP de RabbitMQ.
-    - `exchange_name`: nombre del exchange.
-    - `routing_keys`: lista de routing keys a usar.
-    """
-
-    _FANOUT_ROUTING_KEY = "__mm_broadcast__"
-
     def __init__(self, host, exchange_name, routing_keys):
-        """
-        Crea una instancia asociada a un exchange y una lista de routing keys.
-
-        Parámetros:
-        - `host`: host/IP de RabbitMQ.
-        - `exchange_name`: nombre del exchange.
-        - `routing_keys`: routing keys de suscripción/publicación.
-        """
         self.exchange_name = exchange_name
-        if isinstance(routing_keys, str):
-            self.routing_keys = [routing_keys]
-        else:
-            self.routing_keys = routing_keys or []
-
+        self.routing_keys = routing_keys
+        self.__call_function_with_error_mapping(self.__stablish_connection, host, exchange_name)
+    
+    
+    @staticmethod
+    def __call_function_with_error_mapping(func, *args, **kwargs):
         try:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
-            self.channel = self.connection.channel()
-            self.channel.exchange_declare(exchange=exchange_name, exchange_type='direct')
-        except AMQPConnectionError as error:
+            return func(*args, **kwargs)
+        except (ChannelClosed, ChannelClosedByBroker, ChannelClosedByClient, ChannelWrongStateError,
+                ConnectionClosed, ConnectionClosedByBroker, ConnectionClosedByClient, ConnectionWrongStateError) as error:
+            raise MessageMiddlewareCloseError("RabbitMQ channel or connection was closed") from error
+        except (AMQPConnectionError, StreamLostError) as error:
             raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
-        except Exception as error:
+        except AMQPError as error:
             raise MessageMiddlewareMessageError(
-                f"Failed to initialize exchange middleware for '{exchange_name}': {str(error)}"
+                f"Failed to execute RabbitMQ operation: {str(error)}"
             ) from error
 
-    def _ensure_open(self):
-        if not self.connection.is_open or not self.channel.is_open:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ")
 
     def start_consuming(self, on_message_callback):
-        """
-        Inicia el consumo bloqueante de mensajes del exchange.
+        self.__call_function_with_error_mapping(self.__reserve_receiver_resources, on_message_callback)
+        self.__call_function_with_error_mapping(self.channel.start_consuming)
 
-        Parámetros:
-        - `on_message_callback`: función con firma
-          `callback(message, ack, nack)`.
-        """
-        try:
-            self._ensure_open()
 
-            result = self.channel.queue_declare(queue='', exclusive=True, auto_delete=True)
-            self.queue_name = result.method.queue
+    def stop_consuming(self):
+        self.__call_function_with_error_mapping(self.channel.stop_consuming)
 
-            for routing_key in self.routing_keys:
-                self.channel.queue_bind(
+
+    def send(self, message):
+        for routing_key in self.routing_keys:
+            self.__call_function_with_error_mapping(
+                lambda: self.channel.basic_publish(
                     exchange=self.exchange_name,
-                    queue=self.queue_name,
                     routing_key=routing_key,
+                    body=message,
                 )
+            )
 
+
+    def close(self):
+        self.__call_function_with_error_mapping(lambda: self.connection.close())
+
+
+    def __stablish_connection(self, host, exchange_name):
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        self.channel = self.connection.channel()
+        self.channel.exchange_declare(exchange=exchange_name, exchange_type='direct')
+
+
+    def __bind_all_routing_keys(self ):
+        for routing_key in self.routing_keys:
             self.channel.queue_bind(
                 exchange=self.exchange_name,
                 queue=self.queue_name,
-                routing_key=self._FANOUT_ROUTING_KEY,
+                routing_key=routing_key,
             )
-        except MessageMiddlewareDisconnectedError:
-            raise
-        except AMQPConnectionError as error:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
-        except Exception as error:
-            raise MessageMiddlewareMessageError(
-                f"Failed to prepare consumer for exchange '{self.exchange_name}': {str(error)}"
-            ) from error
 
+
+    def __reserve_receiver_resources(self, on_message_callback):
         def callback(ch, method, properties, body):
-            try:
-                self._ensure_open()
-
-                def ack():
-                    try:
-                        ch.basic_ack(delivery_tag=method.delivery_tag)
-                    except AMQPError as error:
-                        raise MessageMiddlewareMessageError(f"Failed to ack message: {str(error)}") from error
-
-                def nack():
-                    try:
-                        ch.basic_nack(delivery_tag=method.delivery_tag)
-                    except AMQPError as error:
-                        raise MessageMiddlewareMessageError(f"Failed to nack message: {str(error)}") from error
-
-                on_message_callback(
-                    body,
-                    ack,
-                    nack,
-                )
-            except MessageMiddlewareDisconnectedError:
-                raise
-            except Exception as e:
-                raise MessageMiddlewareMessageError(
-                    f"An error occurred while processing the message: {str(e)}"
-                )
-
-        try:
-            self._ensure_open()
-            self.channel.basic_consume(queue=self.queue_name, on_message_callback=callback, auto_ack=False)
-            self.channel.start_consuming()
-        except MessageMiddlewareDisconnectedError:
-            raise
-        except AMQPConnectionError as error:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
-        except Exception as error:
-            raise MessageMiddlewareMessageError(
-                f"Failed to consume exchange '{self.exchange_name}': {str(error)}"
-            ) from error
-
-    def stop_consuming(self):
-        """Detiene el loop de consumo iniciado con `start_consuming()`."""
-        try:
-            self._ensure_open()
-            self.channel.stop_consuming()
-        except MessageMiddlewareDisconnectedError:
-            raise
-        except Exception as error:
-            raise MessageMiddlewareMessageError(f"Failed to stop exchange consumer: {str(error)}") from error
-
-    def send(self, message):
-        """
-        Publica el mensaje en el exchange.
-
-        Parámetros:
-        - `message`: contenido a publicar (bytes).
-
-        Comportamiento:
-        - Publica una vez por cada routing key configurada.
-        - Si no hay routing keys, publica una sola vez con una routing key interna
-          de broadcast para que todos los consumidores del exchange la reciban.
-        """
-        try:
-            self._ensure_open()
-            routing_keys = self.routing_keys if self.routing_keys else [self._FANOUT_ROUTING_KEY]
-            for routing_key in routing_keys:
-                self.channel.basic_publish(exchange=self.exchange_name, routing_key=routing_key, body=message)
-        except MessageMiddlewareDisconnectedError:
-            raise
-        except AMQPConnectionError as error:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
-        except Exception as error:
-            raise MessageMiddlewareMessageError(
-                f"Failed to send message to exchange '{self.exchange_name}': {str(error)}"
-            ) from error
-
-    def close(self):
-        """Cierra la conexión de la instancia."""
-        try:
-            if getattr(self, "channel", None) and self.channel.is_open:
-                self.channel.close()
-            if getattr(self, "connection", None) and self.connection.is_open:
-                self.connection.close()
-        except Exception as error:
-            raise MessageMiddlewareCloseError("Failed to close the connection to RabbitMQ") from error
+            on_message_callback(
+                body,
+                lambda: self.__call_function_with_error_mapping(lambda: ch.basic_ack(delivery_tag=method.delivery_tag)),
+                lambda: self.__call_function_with_error_mapping(lambda: ch.basic_nack(delivery_tag=method.delivery_tag)),
+            )
+        result = self.channel.queue_declare(queue='', exclusive=True, auto_delete=True)
+        self.queue_name = result.method.queue
+        self.__bind_all_routing_keys()
+        self.channel.basic_consume(queue=self.queue_name, on_message_callback=callback, auto_ack=False)
